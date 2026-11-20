@@ -1,0 +1,12 @@
+# Deployment keys — never commit these
+id_termux
+id_termux.pub
+*_rsa
+*.pem
+
+# Python
+__pycache__/
+*.pyc
+
+# Logs and scratch output
+*.log
