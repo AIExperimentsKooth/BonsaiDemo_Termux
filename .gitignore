@@ -10,3 +10,6 @@ __pycache__/
 
 # Logs and scratch output
 *.log
+
+# Saved chat sessions (runtime data)
+sessions/

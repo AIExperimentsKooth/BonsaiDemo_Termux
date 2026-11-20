@@ -21,6 +21,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -28,6 +29,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
+import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlsplit
 
@@ -53,6 +55,8 @@ SYSTEM_PROMPT = (
 )
 
 TOOL_NAMES = ["list_dir", "read_file", "write_file", "patch", "run_bash", "finish"]
+SAVED_EVENT_TYPES = ("step", "assistant", "tool", "observation", "final", "error")
+SESSION_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 OBS_CHARS = 1200      # per-message cap when re-sending history
 READ_CHARS = 6000     # cap for read_file output
 BASH_CHARS = 4000     # cap for run_bash output
@@ -679,6 +683,134 @@ class ModelManager:
                 self.switching = False
 
 
+class SessionStore:
+    """Chat sessions on disk: one JSON file each, plus a pointer to the last one.
+
+    A session is {"id", "title", "created", "updated", "model", "turns"} where
+    each turn keeps the task and the events the browser rendered, so the UI can
+    replay it. Writes are atomic (temp file + os.replace) and serialised by a
+    lock, because a running turn saves after every event.
+    """
+
+    def __init__(self, root):
+        self.root = os.path.abspath(os.path.expanduser(root))
+        os.makedirs(self.root, exist_ok=True)
+        self.lock = threading.Lock()
+        self._last_file = os.path.join(self.root, "last.txt")
+
+    # -- paths -------------------------------------------------------------
+    def _path(self, sid):
+        if not SESSION_ID_RE.match(str(sid or "")):
+            raise ValueError("bad session id: %r" % (sid,))
+        return os.path.join(self.root, str(sid) + ".json")
+
+    # -- last-session pointer ---------------------------------------------
+    def _pointer(self):
+        """The id written in last.txt, whether or not that session still exists."""
+        try:
+            with open(self._last_file, "r", encoding="utf-8") as fh:
+                return fh.read().strip()
+        except OSError:
+            return ""
+
+    def last(self):
+        sid = self._pointer()
+        if not sid:
+            return None
+        try:
+            return sid if os.path.isfile(self._path(sid)) else None
+        except ValueError:
+            return None
+
+    def set_last(self, sid):
+        try:
+            path = self._path(sid)
+        except ValueError:
+            return
+        with self.lock:
+            tmp = self._last_file + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as fh:
+                fh.write(str(sid) + "\n")
+            os.replace(tmp, self._last_file)
+
+    # -- crud --------------------------------------------------------------
+    def load(self, sid):
+        try:
+            with open(self._path(sid), "r", encoding="utf-8") as fh:
+                sess = json.load(fh)
+        except (OSError, ValueError):
+            return None
+        return sess if isinstance(sess, dict) and sess.get("id") else None
+
+    def save(self, sess):
+        sess["updated"] = time.time()
+        path = self._path(sess["id"])
+        with self.lock:
+            tmp = path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as fh:
+                json.dump(sess, fh, ensure_ascii=False, indent=1)
+            os.replace(tmp, path)
+        return sess
+
+    def create(self, title="", model=None):
+        sid = time.strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:6]
+        now = time.time()
+        sess = {
+            "id": sid,
+            "title": (str(title or "").strip() or "new session")[:80],
+            "created": now,
+            "updated": now,
+            "model": model,
+            "turns": [],
+        }
+        self.save(sess)
+        self.set_last(sid)
+        return sess
+
+    def list(self):
+        out = []
+        try:
+            names = sorted(os.listdir(self.root))
+        except OSError:
+            return out
+        for name in names:
+            if not name.endswith(".json"):
+                continue
+            sess = self.load(name[: -len(".json")])
+            if not sess:
+                continue
+            turns = sess.get("turns") or []
+            last_task = ""
+            for turn in reversed(turns):
+                if turn.get("task"):
+                    last_task = str(turn["task"])[:120]
+                    break
+            out.append({
+                "id": sess["id"],
+                "title": sess.get("title") or "(untitled)",
+                "created": sess.get("created") or 0,
+                "updated": sess.get("updated") or 0,
+                "model": sess.get("model"),
+                "turns": len(turns),
+                "last_task": last_task,
+            })
+        out.sort(key=lambda s: s["updated"], reverse=True)
+        return out
+
+    def delete(self, sid):
+        try:
+            os.remove(self._path(sid))
+        except (OSError, ValueError):
+            return False
+        # Compare the raw pointer: the file is gone, so last() already returns None.
+        if self._pointer() == str(sid):
+            try:
+                os.remove(self._last_file)
+            except OSError:
+                pass
+        return True
+
+
 # --------------------------------------------------------------------------
 # http
 # --------------------------------------------------------------------------
@@ -729,6 +861,15 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/models":
             self._send(200, json.dumps(self.manager.models_payload()))
             return
+        if path == "/api/sessions":
+            self._send(200, json.dumps({
+                "sessions": self.cfg.sessions.list(),
+                "last": self.cfg.sessions.last(),
+            }))
+            return
+        if path.startswith("/api/sessions/"):
+            self._handle_session_get(path[len("/api/sessions/"):])
+            return
         if path == "/favicon.ico":
             self._send(204, b"")
             return
@@ -760,9 +901,26 @@ class Handler(BaseHTTPRequestHandler):
         info["model_label"] = m["label"] if m else info["model"]
         return info
 
+    def _handle_session_get(self, sid):
+        """Return one session and remember it as the last one the UI opened."""
+        if not sid or "/" in sid:
+            self._send(404, json.dumps({"error": "not found"}))
+            return
+        try:
+            sess = self.cfg.sessions.load(sid)
+        except ValueError as exc:
+            self._send(400, json.dumps({"error": str(exc)}))
+            return
+        if sess is None:
+            self._send(404, json.dumps({"error": "no such session: %s" % sid}))
+            return
+        self.cfg.sessions.set_last(sid)
+        self._send(200, json.dumps(sess))
+
     def do_POST(self):
         path = self.path.split("?")[0]
-        if path not in ("/api/run", "/api/switch"):
+        is_delete = path.startswith("/api/sessions/") and path.endswith("/delete")
+        if path not in ("/api/run", "/api/switch", "/api/sessions/new") and not is_delete:
             self._send(404, json.dumps({"error": "not found"}))
             return
         try:
@@ -774,6 +932,19 @@ class Handler(BaseHTTPRequestHandler):
 
         if path == "/api/switch":
             self._handle_switch(body)
+            return
+        if path == "/api/sessions/new":
+            sess = self.cfg.sessions.create(body.get("title") or "", self.manager.current)
+            self._send(200, json.dumps(sess))
+            return
+        if is_delete:
+            sid = path[len("/api/sessions/"):-len("/delete")]
+            if not sid or "/" in sid:
+                self._send(404, json.dumps({"error": "not found"}))
+                return
+            ok = self.cfg.sessions.delete(sid)
+            self._send(200 if ok else 404,
+                       json.dumps({"deleted": ok, "id": sid, "last": self.cfg.sessions.last()}))
             return
         self._handle_run(body)
 
@@ -812,9 +983,42 @@ class Handler(BaseHTTPRequestHandler):
             self._send(409, json.dumps({"error": blocked}))
             return
 
+        # A run is appended to a saved session; without a session_id a new one starts.
+        store = self.cfg.sessions
+        sess = None
+        sid = str(body.get("session_id") or "").strip()
+        if sid:
+            try:
+                sess = store.load(sid)
+            except ValueError:
+                sess = None
+        if sess is None:
+            sess = store.create(task[:80], self.manager.current)
+        else:
+            store.set_last(sess["id"])
+        turn = {
+            "task": task,
+            "started": time.time(),
+            "max_steps": max_steps,
+            "model": self.manager.current,
+            "events": [],
+        }
+        sess.setdefault("turns", []).append(turn)
+        if len(sess["turns"]) == 1 or (sess.get("title") or "").strip() in ("", "new session"):
+            sess["title"] = task[:80]
+        store.save(sess)
+
         try:
             self._sse_start()
+            self._sse_send(event("session", id=sess["id"], title=sess.get("title")))
             for ev in run_agent(self.cfg, task, max_steps, max_tokens):
+                # Save before sending, so a client disconnect cannot lose the event.
+                if ev.get("type") in SAVED_EVENT_TYPES:
+                    turn["events"].append(ev)
+                    try:
+                        store.save(sess)
+                    except OSError as exc:
+                        log("could not save session %s: %s" % (sess["id"], exc))
                 self._sse_send(ev)
         except (BrokenPipeError, ConnectionResetError):
             log("client disconnected; run abandoned")
@@ -866,6 +1070,8 @@ def main(argv=None):
                     help="start script used to (re)load a model")
     ap.add_argument("--server-log", default=DEFAULT_SERVER_LOG,
                     help="log file the model server writes to")
+    ap.add_argument("--sessions", default=os.path.join(HERE, "sessions"),
+                    help="directory for saved chat sessions")
     ap.add_argument("--load-timeout", type=int, default=1800,
                     help="seconds to wait for a freshly loaded model to answer /health")
     ap.add_argument("--unload-timeout", type=int, default=60,
@@ -879,6 +1085,7 @@ def main(argv=None):
     cfg.server_script = os.path.realpath(os.path.expanduser(cfg.server_script))
     cfg.server_log = os.path.realpath(os.path.expanduser(cfg.server_log))
     cfg.base_url = cfg.base_url.rstrip("/")
+    cfg.sessions = SessionStore(cfg.sessions)
 
     manager = ModelManager(cfg)
     manager.detect_current()

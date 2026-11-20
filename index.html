@@ -79,6 +79,11 @@
     model <select id="model-select" title="model to load"></select>
     <button id="switch" class="small" disabled>switch</button>
   </span>
+  <span class="meta">
+    session <select id="session-select" title="saved sessions"></select>
+    <button id="new-session" class="small">new</button>
+    <button id="del-session" class="small">delete</button>
+  </span>
   <span class="meta">loaded <b id="m-model">…</b></span>
   <span class="meta">workspace <b id="m-ws">…</b></span>
   <span class="meta">tools <b id="m-tools">…</b></span>
@@ -108,6 +113,7 @@ const $ = (id) => document.getElementById(id);
 let ctrl = null;
 let busy = false;          // a turn or a switch owns the model
 let models = [];
+let currentSession = null;   // id of the session the log currently shows
 
 const fmtSecs = (s) => s == null ? '?' : (s < 90 ? Math.round(s) + 's' : Math.round(s / 60) + ' min');
 
@@ -162,6 +168,10 @@ function handle(ev) {
     case 'error':
       streamPre = null;
       addEvent('error', 'error').textContent = ev.message;
+      break;
+    case 'session':
+      currentSession = ev.id;
+      $('status').textContent = 'session ' + (ev.title || ev.id);
       break;
   }
 }
@@ -228,8 +238,88 @@ function setBusy(state, statusText) {
   $('stop').disabled = !state || state === 'switch';
   $('model-select').disabled = state;
   $('switch').disabled = state || $('model-select').value === undefined;
+  $('session-select').disabled = state;
+  $('new-session').disabled = state;
+  $('del-session').disabled = state || !$('session-select').value;
   if (statusText) $('status').textContent = statusText;
   if (!state) loadModels().catch(() => {});
+}
+
+// ---- sessions ----------------------------------------------------------
+const fmtWhen = (ts) => ts ? new Date(ts * 1000).toLocaleString() : '?';
+
+async function loadSessions(preferId) {
+  const data = await (await fetch('/api/sessions')).json();
+  const sel = $('session-select');
+  const keep = preferId || currentSession || sel.value;
+  sel.innerHTML = '';
+  for (const s of data.sessions || []) {
+    const o = document.createElement('option');
+    o.value = s.id;
+    o.textContent = (s.title || '(untitled)') + ' · ' + s.turns + ' turn' + (s.turns === 1 ? '' : 's');
+    o.title = 'updated ' + fmtWhen(s.updated) + (s.last_task ? '\n' + s.last_task : '');
+    sel.appendChild(o);
+  }
+  const ids = (data.sessions || []).map(s => s.id);
+  if (keep && ids.includes(keep)) sel.value = keep;
+  else if (ids.length) sel.value = ids[0];
+  else sel.innerHTML = '<option value="">(no saved sessions)</option>';
+  $('del-session').disabled = busy || !ids.length;
+  return data;
+}
+
+function renderSession(sess) {
+  if (!sess) return;
+  currentSession = sess.id;
+  clearLog();
+  const turns = sess.turns || [];
+  if (!turns.length) {
+    addEvent('step', 'session · ' + (sess.title || 'empty')).textContent = 'no turns yet — type a task below';
+    return;
+  }
+  for (const t of turns) {
+    addEvent('step', 'task · ' + fmtWhen(t.started)).textContent = t.task || '';
+    for (const ev of t.events || []) handle(ev);
+  }
+  $('status').textContent = 'session loaded';
+}
+
+async function openSession(id) {
+  if (!id) return;
+  const res = await fetch('/api/sessions/' + encodeURIComponent(id));
+  if (!res.ok) {
+    addEvent('error', 'session').textContent = 'could not load session ' + id;
+    return;
+  }
+  renderSession(await res.json());
+}
+
+async function newSession() {
+  if (busy) return;
+  const res = await fetch('/api/sessions/new', {
+    method: 'POST', headers: {'Content-Type': 'application/json'}, body: '{}',
+  });
+  if (!res.ok) { addEvent('error', 'session').textContent = 'could not create a session'; return; }
+  const sess = await res.json();
+  renderSession(sess);
+  await loadSessions(sess.id);
+  $('task').value = '';
+  $('task').focus();
+  $('status').textContent = 'new session';
+}
+
+async function deleteSession() {
+  const id = $('session-select').value;
+  if (busy || !id) return;
+  if (!confirm('Delete this saved session?')) return;
+  await fetch('/api/sessions/' + encodeURIComponent(id) + '/delete', {
+    method: 'POST', headers: {'Content-Type': 'application/json'}, body: '{}',
+  });
+  currentSession = null;
+  const data = await loadSessions();
+  const next = (data.sessions || [])[0];
+  if (next) { await openSession(next.id); await loadSessions(next.id); }
+  else { clearLog(); $('status').textContent = 'no saved sessions'; }
 }
 
 // ---- switch model ------------------------------------------------------
@@ -276,7 +366,8 @@ async function switchModel() {
 async function run() {
   const task = $('task').value.trim();
   if (!task || busy) return;
-  clearLog();
+  if (!currentSession) clearLog();
+  addEvent('step', 'task').textContent = task;
   busy = true;
   ctrl = new AbortController();
   $('run').disabled = true;
@@ -293,6 +384,7 @@ async function run() {
         task,
         max_steps: Number($('max-steps').value),
         max_tokens: Number($('max-tokens').value),
+        session_id: currentSession,
       }),
       signal: ctrl.signal,
     });
@@ -313,6 +405,7 @@ async function run() {
   } finally {
     ctrl = null;
     setBusy(false, $('status').textContent);
+    loadSessions(currentSession).catch(() => {});
   }
 }
 
@@ -320,12 +413,33 @@ $('run').addEventListener('click', run);
 $('switch').addEventListener('click', switchModel);
 $('stop').addEventListener('click', () => { if (ctrl) ctrl.abort(); });
 $('model-select').addEventListener('change', () => { $('switch').disabled = busy; });
+$('session-select').addEventListener('change', () => {
+  openSession($('session-select').value).catch(err => {
+    addEvent('error', 'session').textContent = String(err);
+  });
+});
+$('new-session').addEventListener('click', newSession);
+$('del-session').addEventListener('click', deleteSession);
 $('task').addEventListener('keydown', (e) => {
   if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') run();
 });
 
-loadModels().catch(err => { $('foot').textContent = 'harness unreachable: ' + err; });
-loadInfo();
+(async () => {
+  try {
+    await loadModels();
+  } catch (err) {
+    $('foot').textContent = 'harness unreachable: ' + err;
+  }
+  loadInfo();
+  // Restore the session this browser left off on (falls back to the newest).
+  try {
+    const data = await loadSessions();
+    const last = data.last || ((data.sessions || [])[0] || {}).id;
+    if (last) await openSession(last);
+  } catch (err) {
+    console.warn('could not restore the last session', err);
+  }
+})();
 </script>
 </body>
 </html>

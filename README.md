@@ -112,6 +112,24 @@ than `write_file`, so a one-line fix does not mean resending the whole file:
   does appear, which usually points at indentation or whitespace drift.
 - Binary files, missing files and paths outside the workspace are refused.
 
+## Sessions
+
+Every run is appended to a saved session, so closing the browser or restarting the
+harness does not lose the transcript.
+
+- One JSON file per session in `~/agent-harness/sessions/` (override with `--sessions`),
+  plus `last.txt` pointing at the most recently opened one.
+- A session holds its title, timestamps, model and a list of **turns**; each turn keeps
+  the task and the events the browser rendered, so the UI can replay it.
+- Saves happen after every event, *before* it is sent to the browser, and are atomic
+  (temp file + `os.replace`), so a dropped connection cannot corrupt or truncate a
+  transcript.
+- On page load the UI asks for the last session and renders it; if there is none it
+  falls back to the newest. Picking a different session in the header makes it the new
+  "last".
+- Sessions are history, not context: a new turn still starts from a fresh prompt rather
+  than replaying the transcript back into the model.
+
 ## API
 
 | Route | Method | Purpose |
@@ -121,6 +139,13 @@ than `write_file`, so a one-line fix does not mean resending the whole file:
 | `/api/models` | GET | Registry, `present` flags, `current`, `busy`, `switching` |
 | `/api/run` | POST | Run an agent turn (streams SSE) |
 | `/api/switch` | POST | `{"model": "<id>"}` — unload the current GGUF, then load the new one (SSE: `unloading` → `unloaded` → `loading` → `switch_ready`) |
+| `/api/sessions` | GET | Session index (id, title, turns, updated) plus the `last` session id |
+| `/api/sessions/<id>` | GET | One full session (turns and events); also marks it as last |
+| `/api/sessions/new` | POST | Create an empty session and make it last |
+| `/api/sessions/<id>/delete` | POST | Delete a session |
+
+`/api/run` accepts an optional `session_id`; the first event of the stream is
+`{"type":"session","id":…}`, and without an id a new session is created.
 
 A switch is refused while a turn is streaming (`busy`) or while another switch runs,
 and it unloads the old server **before** starting the new one — loading two 5.5 GB
