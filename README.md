@@ -12,7 +12,7 @@ without touching the phone.
 
 | File | Purpose |
 | --- | --- |
-| `app.py` | Stdlib-only HTTP server: chat UI, agent loop (`list_dir`, `read_file`, `write_file`, `run_bash`, `finish`), model registry and model switching. |
+| `app.py` | Stdlib-only HTTP server: chat UI, agent loop (`list_dir`, `read_file`, `write_file`, `patch`, `run_bash`, `finish`), model registry and model switching. |
 | `index.html` | The web UI (chat, model selector, tool log). |
 | `start_llama_tight.sh` | Wrapper around the Bonsai demo launcher that pins the memory-tight profile: `-np 1`, `-c 2048`, `q4_0` KV cache. Single source of truth for the flags. |
 | `start-all.sh` | Idempotent starter for llama-server + harness. Safe to run repeatedly. |
@@ -93,6 +93,24 @@ The harness takes the usual flags: `--host`, `--port` (default 8081),
 `--base-url` (llama-server, default `http://127.0.0.1:8080`), `--workspace`,
 `--server-script`, `--server-log`, `--models` (JSON list), `--no-bash`,
 `--max-steps`, `--max-tokens`, `--timeout`, `--load-timeout`, `--unload-timeout`.
+
+## Tools
+
+The agent calls exactly one tool per turn and changes files with `patch` rather
+than `write_file`, so a one-line fix does not mean resending the whole file:
+
+```json
+{"tool":"patch","path":"app.py","find":"old exact text","replace":"new text"}
+{"tool":"patch","path":"app.py","edits":[{"find":"a","replace":"b"},{"find":"c","replace":""}]}
+```
+
+- `find` is matched **exactly** and must occur once; more than once is refused as
+  ambiguous unless you pass `"replace_all":true`, and `"replace":""` deletes.
+- All edits are validated before anything is written, so a bad block cannot leave a
+  half-patched file.
+- A miss explains itself: the error names the line where the first line of `find`
+  does appear, which usually points at indentation or whitespace drift.
+- Binary files, missing files and paths outside the workspace are refused.
 
 ## API
 

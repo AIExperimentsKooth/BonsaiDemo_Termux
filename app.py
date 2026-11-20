@@ -41,13 +41,18 @@ SYSTEM_PROMPT = (
     '  {"tool":"list_dir","path":"."}\n'
     '  {"tool":"read_file","path":"notes.txt"}\n'
     '  {"tool":"write_file","path":"out.txt","content":"text"}\n'
+    '  {"tool":"patch","path":"out.txt","find":"exact old text","replace":"new text"}\n'
+    '  {"tool":"patch","path":"out.txt","edits":[{"find":"a","replace":"b"},{"find":"c","replace":"d"}]}\n'
     '  {"tool":"run_bash","command":"ls -la"}\n'
     '  {"tool":"finish","answer":"what you did or found"}\n'
     "Rules: paths are relative to the workspace; one action per turn; "
     "never invent file contents you have not read; call finish when done.\n"
+    "To change part of an existing file use patch, not write_file: read the file, "
+    "then copy the exact text to replace. 'find' must match exactly once (include "
+    "surrounding lines for context), and nothing is written unless every edit matches.\n"
 )
 
-TOOL_NAMES = ["list_dir", "read_file", "write_file", "run_bash", "finish"]
+TOOL_NAMES = ["list_dir", "read_file", "write_file", "patch", "run_bash", "finish"]
 OBS_CHARS = 1200      # per-message cap when re-sending history
 READ_CHARS = 6000     # cap for read_file output
 BASH_CHARS = 4000     # cap for run_bash output
@@ -135,6 +140,94 @@ def tool_write_file(ws, path, content):
     return "wrote %d bytes to %s" % (len(text), os.path.relpath(target, ws))
 
 
+def _line_count(text):
+    if not text:
+        return 0
+    return text.count("\n") + (0 if text.endswith("\n") else 1)
+
+
+def _patch_hint(text, find):
+    """Explain why an exact 'find' block did not match."""
+    lines = [ln for ln in find.splitlines() if ln.strip()]
+    if not lines:
+        return ""
+    needle = lines[0].strip()
+    hits = [i for i, ln in enumerate(text.splitlines(), 1) if needle in ln]
+    if not hits:
+        return " (its first line %r appears nowhere in the file either)" % needle[:80]
+    return (
+        " (its first line %r appears on line%s %s - check indentation and exact whitespace)"
+        % (needle[:80], "" if len(hits) == 1 else "s", ", ".join(str(h) for h in hits[:5]))
+    )
+
+
+def tool_patch(ws, path, find=None, replace=None, edits=None, replace_all=False):
+    """Replace exact snippets in an existing file.
+
+    Sending only the changed text keeps a fix small instead of resending the
+    whole file. Every edit must match; the file is written only if all succeed.
+    """
+    target = resolve_in_workspace(ws, path)
+    if not os.path.isfile(target):
+        return "no such file: %s (use write_file to create a new file)" % path
+    try:
+        with open(target, "rb") as fh:
+            raw = fh.read()
+    except OSError as exc:
+        return "read failed: %s" % exc
+    if b"\x00" in raw:
+        return "refusing to patch a binary file: %s" % path
+    text = raw.decode("utf-8", "replace")
+
+    ops = []
+    if isinstance(edits, list) and edits:
+        for i, item in enumerate(edits):
+            if not isinstance(item, dict):
+                return "edits[%d] must be an object with find/replace" % i
+            if not isinstance(item.get("find"), str) or item["find"] == "":
+                return "edits[%d]: 'find' must be a non-empty string" % i
+            rep = item.get("replace", "")
+            ops.append((item["find"], "" if rep is None else str(rep)))
+    elif find is not None:
+        if not isinstance(find, str) or find == "":
+            return "'find' must be a non-empty string"
+        if replace is None:
+            return 'add "replace": "" to delete the matched text'
+        ops.append((find, str(replace)))
+    else:
+        return (
+            "patch needs 'find' and 'replace' (or an 'edits' list of them); "
+            "read the file first so you can copy the exact text"
+        )
+
+    updated = text
+    for n, (needle, rep) in enumerate(ops, 1):
+        count = updated.count(needle)
+        if count == 0:
+            return "edit %d: text not found%s\nno changes written" % (
+                n, _patch_hint(updated, needle)
+            )
+        if count > 1 and not replace_all:
+            return (
+                "edit %d: 'find' matches %d times - include more surrounding context, "
+                "or pass \"replace_all\":true\nno changes written" % (n, count)
+            )
+        updated = updated.replace(needle, rep)
+
+    if updated == text:
+        return "patch matched but left %s unchanged" % path
+    try:
+        # newline="" keeps the file's existing line endings byte-for-byte.
+        with open(target, "w", encoding="utf-8", newline="") as fh:
+            fh.write(updated)
+    except OSError as exc:
+        return "write failed: %s" % exc
+    return "patched %s: %d edit%s, %d -> %d bytes, %d -> %d lines" % (
+        os.path.relpath(target, ws), len(ops), "" if len(ops) == 1 else "s",
+        len(text), len(updated), _line_count(text), _line_count(updated),
+    )
+
+
 def tool_run_bash(ws, command, timeout=BASH_TIMEOUT):
     if not command or not str(command).strip():
         return "no command given"
@@ -161,6 +254,14 @@ def execute_tool(ws, name, action, allow_bash=True):
             return tool_read_file(ws, action.get("path", ""))
         if name == "write_file":
             return tool_write_file(ws, action.get("path", ""), action.get("content", ""))
+        if name == "patch":
+            return tool_patch(
+                ws, action.get("path", ""),
+                find=action.get("find"),
+                replace=action.get("replace"),
+                edits=action.get("edits"),
+                replace_all=bool(action.get("replace_all") or action.get("all")),
+            )
         if name == "run_bash":
             if not allow_bash:
                 return "run_bash is disabled on this harness (start it without --no-bash)"
